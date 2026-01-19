@@ -1,167 +1,250 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import json
 import time
+import re
+from typing import Dict, List
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import requests
 from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PWTimeout
 
-# ================== ENV ==================
+# ================= ENV =================
 LOGIN_USER = os.environ["LOGIN_USER"]
 LOGIN_PASS = os.environ["LOGIN_PASS"]
-PAGE_URL = os.environ["PAGE_URL"]
+PAGE_URL   = os.environ["PAGE_URL"]
 
 TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_IDS = [
-    os.environ.get("TELEGRAM_CHAT_ID_1"),
-    os.environ.get("TELEGRAM_CHAT_ID_2"),
-]
-CHAT_IDS = [c for c in CHAT_IDS if c]
+TG_CHAT_ID_1 = os.getenv("TELEGRAM_CHAT_ID_1")
+TG_CHAT_ID_2 = os.getenv("TELEGRAM_CHAT_ID_2")
+CHAT_IDS = [c for c in (TG_CHAT_ID_1, TG_CHAT_ID_2) if c]
 
-GIST_ID = os.environ["GIST_ID"]
+GIST_ID    = os.environ["GIST_ID"]
 GIST_TOKEN = os.environ["GIST_TOKEN"]
-GIST_FILENAME = os.environ.get("GIST_FILENAME", "keitaro_state.json")
+GIST_FILENAME = os.getenv("GIST_FILENAME", "keitaro_state.json")
 
-# ================== TELEGRAM ==================
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+EPS = 0.0001
+
+# ================= HELPERS =================
+def now_kyiv():
+    return datetime.now(KYIV_TZ)
+
+def today():
+    return now_kyiv().strftime("%Y-%m-%d")
+
+def as_float(x):
+    try:
+        return float(x or 0)
+    except:
+        return 0.0
+
+def money(x):
+    return f"${x:,.2f}"
+
+# ================= TELEGRAM =================
 def tg_send(text: str):
-    for chat_id in CHAT_IDS:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text}
-        )
+    for cid in CHAT_IDS:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                json={
+                    "chat_id": cid,
+                    "text": text,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": True
+                },
+                timeout=15
+            )
+        except:
+            pass
 
-# ================== GIST ==================
-def load_state():
-    r = requests.get(
-        f"https://api.github.com/gists/{GIST_ID}",
-        headers={"Authorization": f"token {GIST_TOKEN}"}
-    )
-    if r.status_code != 200:
-        return {}
-    files = r.json().get("files", {})
-    if GIST_FILENAME not in files:
-        return {}
-    return json.loads(files[GIST_FILENAME]["content"])
+# ================= GIST STATE =================
+def load_state() -> Dict:
+    url = f"https://api.github.com/gists/{GIST_ID}"
+    r = requests.get(url, headers={
+        "Authorization": f"Bearer {GIST_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }, timeout=30)
 
-def save_state(state: dict):
+    if r.status_code == 200:
+        files = r.json().get("files", {})
+        if GIST_FILENAME in files:
+            try:
+                return json.loads(files[GIST_FILENAME]["content"])
+            except:
+                pass
+
+    return {"date": today(), "rows": {}}
+
+def save_state(state: Dict):
+    url = f"https://api.github.com/gists/{GIST_ID}"
     requests.patch(
-        f"https://api.github.com/gists/{GIST_ID}",
+        url,
         headers={
-            "Authorization": f"token {GIST_TOKEN}",
-            "Content-Type": "application/json"
+            "Authorization": f"Bearer {GIST_TOKEN}",
+            "Accept": "application/vnd.github+json"
         },
         json={
             "files": {
                 GIST_FILENAME: {
-                    "content": json.dumps(state, indent=2)
+                    "content": json.dumps(state, indent=2, ensure_ascii=False)
                 }
             }
-        }
+        },
+        timeout=30
     )
 
-# ================== PARSER ==================
-def fetch_rows():
-    collected = []
+# ================= PARSER =================
+def parse_report_from_json(payload: dict) -> List[Dict]:
+    rows = []
+    raw = payload.get("rows")
+    if not isinstance(raw, list):
+        return rows
 
-    def is_keitaro_report(payload: dict) -> bool:
-        if not isinstance(payload, dict):
-            return False
-        rows = payload.get("rows")
-        if not isinstance(rows, list) or not rows:
-            return False
-        sample = rows[0]
-        return (
-            "country" in sample and
-            "creative_id" in sample and
-            "sub_id_2" in sample
+    for r in raw:
+        dims = r.get("dimensions", {})
+        if isinstance(dims, dict):
+            rr = dict(dims)
+            rr.update(r)
+            r = rr
+
+        country = r.get("country") or r.get("geo") or ""
+        creative = r.get("creative_id") or ""
+        sub2 = r.get("sub_id_2") or ""
+
+        leads = as_float(r.get("conversions"))
+        sales = as_float(r.get("sales"))
+        revenue = as_float(r.get("revenue"))
+
+        if not (country or creative or sub2):
+            continue
+
+        rows.append({
+            "k": f"{country}|{creative}|{sub2}",
+            "country": country,
+            "creative": creative,
+            "sub2": sub2,
+            "leads": leads,
+            "sales": sales,
+            "revenue": revenue,
+        })
+
+    return rows
+
+# ================= FETCH =================
+def fetch_rows() -> List[Dict]:
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"]
         )
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context()
+        ctx = browser.new_context(
+            viewport={"width": 1400, "height": 900},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        )
         page = ctx.new_page()
 
+        # -------- LOGIN --------
+        page.goto("https://digitaltraff.click/admin/", wait_until="domcontentloaded")
+
+        page.fill("input[name='login'], input[type='text']", LOGIN_USER)
+        page.fill("input[name='password'], input[type='password']", LOGIN_PASS)
+
+        try:
+            page.get_by_role("button", name=re.compile("sign in|log in|увійти|войти", re.I)).click()
+        except:
+            page.keyboard.press("Enter")
+
+        try:
+            page.wait_for_selector("app-login", state="detached", timeout=15000)
+        except PWTimeout:
+            pass
+
+        captured = []
+        best_score = -1.0
+
         def on_response(resp):
+            nonlocal captured, best_score
             try:
-                if resp.request.method != "POST":
-                    return
                 data = resp.json()
-                if is_keitaro_report(data):
-                    collected.extend(data["rows"])
-            except Exception:
-                pass
+            except:
+                return
 
-        page.on("response", on_response)
+            rows = parse_report_from_json(data)
+            if not rows:
+                return
 
-        # LOGIN
-        page.goto("https://digitaltraff.click/admin/login", timeout=60000)
-        page.fill("input[name=email]", LOGIN_USER)
-        page.fill("input[name=password]", LOGIN_PASS)
-        page.click("button[type=submit]")
-        page.wait_for_load_state("networkidle")
+            score = sum(r["leads"] + r["sales"] + r["revenue"] for r in rows)
+            if score > best_score:
+                captured = rows
+                best_score = score
 
-        # OPEN REPORT PAGE (HASH URL)
-        page.goto(PAGE_URL, timeout=60000)
-        page.wait_for_load_state("networkidle")
+        ctx.on("response", on_response)
 
-        time.sleep(6)  # даём Angular/XHR отработать
+        page.goto(PAGE_URL, wait_until="domcontentloaded")
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except PWTimeout:
+            pass
+
+        time.sleep(1.5)
         browser.close()
 
-    return collected
+        return captured
 
-# ================== MAIN ==================
+# ================= MAIN =================
 def main():
-    prev = load_state()
-    curr = {}
+    state = load_state()
+    prev_rows = state.get("rows", {})
+    prev_date = state.get("date")
 
     rows = fetch_rows()
     if not rows:
-        tg_send("⚠️ Keitaro: rows not found (check filters or auth)")
         return
 
+    if prev_date != today():
+        save_state({"date": today(), "rows": {r["k"]: r for r in rows}})
+        return
+
+    new_rows = {}
+    lead_msgs = []
+    sale_msgs = []
+
     for r in rows:
-        country = r.get("country", "—")
-        creative = r.get("creative_id", "—")
-        sub2 = r.get("sub_id_2", "—")
+        k = r["k"]
+        old = prev_rows.get(k, {"leads": 0, "sales": 0, "revenue": 0})
 
-        conversions = int(r.get("conversions") or 0)
-        sales = int(r.get("sales") or 0)
-        revenue = float(r.get("revenue") or 0)
-
-        key = f"{country}|{creative}|{sub2}"
-
-        old = prev.get(key, {
-            "conversions": 0,
-            "sales": 0,
-            "revenue": 0
-        })
-
-        # LEAD
-        if conversions > old["conversions"]:
-            tg_send(
-                f"🟢 LEAD\n"
-                f"Country: {country}\n"
-                f"Company: {sub2}\n"
-                f"Leads: {old['conversions']} → {conversions}"
+        if r["leads"] - old["leads"] > EPS:
+            lead_msgs.append(
+                "🟩 *LEAD ALERT*\n"
+                f"Country: {r['country']}\n"
+                f"Creative ID: {r['creative']}\n"
+                f"Sub ID 2: {r['sub2']}\n"
+                f"Leads: {int(old['leads'])} → {int(r['leads'])}"
             )
 
-        # SALE
-        if sales > old["sales"]:
-            delta = revenue - old["revenue"]
-            tg_send(
-                f"🔵 SALE\n"
-                f"Country: {country}\n"
-                f"Creative: {creative}\n"
-                f"Company: {sub2}\n"
-                f"Revenue: +${delta:.2f}"
+        if r["sales"] - old["sales"] > EPS:
+            delta_rev = r["revenue"] - old["revenue"]
+            sale_msgs.append(
+                "🟦 *SALE ALERT*\n"
+                f"Country: {r['country']}\n"
+                f"Creative ID: {r['creative']}\n"
+                f"Sub ID 2: {r['sub2']}\n"
+                f"Sales: {int(old['sales'])} → {int(r['sales'])}\n"
+                f"Revenue: {money(delta_rev)}"
             )
 
-        curr[key] = {
-            "conversions": conversions,
-            "sales": sales,
-            "revenue": revenue
-        }
+        new_rows[k] = r
 
-    save_state(curr)
+    if lead_msgs or sale_msgs:
+        tg_send("\n\n".join(lead_msgs + sale_msgs))
 
-# ================== RUN ==================
+    save_state({"date": today(), "rows": new_rows})
+
 if __name__ == "__main__":
     main()
