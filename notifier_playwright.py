@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import json
-import time
-import re
-from typing import Dict, List
+import os, json, time
+from typing import Any, Dict, List, Tuple, Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
-from playwright.sync_api import sync_playwright
-from playwright.sync_api import TimeoutError as PWTimeout
 
 # ================= ENV =================
-LOGIN_USER = os.environ["LOGIN_USER"]
-LOGIN_PASS = os.environ["LOGIN_PASS"]
-PAGE_URL   = os.environ["PAGE_URL"]
+BASE_URL = os.environ.get("KEITARO_BASE_URL", "https://digitaltraff.click").rstrip("/")
+API_KEY  = os.environ["KEITARO_API_KEY"]              # положи в GitHub Secrets
+# Сюда кладём JSON конфиг отчёта campaigns.report (ровно как в preferences)
+REPORT_CONFIG_JSON = os.environ["KEITARO_REPORT_CONFIG_JSON"]
 
 TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TG_CHAT_ID_1 = os.getenv("TELEGRAM_CHAT_ID_1")
+TG_CHAT_ID_1 = os.getenv("TELEGRAM_CHAT_ID_1") or os.getenv("TELEGRAM_CHAT_ID")
 TG_CHAT_ID_2 = os.getenv("TELEGRAM_CHAT_ID_2")
 CHAT_IDS = [c for c in (TG_CHAT_ID_1, TG_CHAT_ID_2) if c]
 
@@ -30,47 +26,43 @@ GIST_FILENAME = os.getenv("GIST_FILENAME", "keitaro_state.json")
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 EPS = 0.0001
 
-# ================= HELPERS =================
-def now_kyiv():
-    return datetime.now(KYIV_TZ)
+# ================= helpers =================
+def today() -> str:
+    return datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
 
-def today():
-    return now_kyiv().strftime("%Y-%m-%d")
-
-def as_float(x):
+def as_float(v: Any) -> float:
     try:
-        return float(x or 0)
+        if v is None:
+            return 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip().replace("$", "").replace(",", "")
+        return float(s) if s else 0.0
     except:
         return 0.0
 
-def money(x):
+def money(x: float) -> str:
     return f"${x:,.2f}"
 
-# ================= TELEGRAM =================
+# ================= Telegram =================
 def tg_send(text: str):
     for cid in CHAT_IDS:
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                json={
-                    "chat_id": cid,
-                    "text": text,
-                    "parse_mode": "Markdown",
-                    "disable_web_page_preview": True
-                },
-                timeout=15
+                json={"chat_id": cid, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True},
+                timeout=20
             )
         except:
             pass
 
-# ================= GIST STATE =================
+# ================= Gist =================
 def load_state() -> Dict:
     url = f"https://api.github.com/gists/{GIST_ID}"
     r = requests.get(url, headers={
         "Authorization": f"Bearer {GIST_TOKEN}",
         "Accept": "application/vnd.github+json"
     }, timeout=30)
-
     if r.status_code == 200:
         files = r.json().get("files", {})
         if GIST_FILENAME in files:
@@ -78,173 +70,194 @@ def load_state() -> Dict:
                 return json.loads(files[GIST_FILENAME]["content"])
             except:
                 pass
-
     return {"date": today(), "rows": {}}
 
 def save_state(state: Dict):
     url = f"https://api.github.com/gists/{GIST_ID}"
-    requests.patch(
-        url,
-        headers={
-            "Authorization": f"Bearer {GIST_TOKEN}",
-            "Accept": "application/vnd.github+json"
-        },
-        json={
-            "files": {
-                GIST_FILENAME: {
-                    "content": json.dumps(state, indent=2, ensure_ascii=False)
-                }
-            }
-        },
-        timeout=30
-    )
+    requests.patch(url, headers={
+        "Authorization": f"Bearer {GIST_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }, json={
+        "files": {GIST_FILENAME: {"content": json.dumps(state, ensure_ascii=False, indent=2)}}
+    }, timeout=30).raise_for_status()
 
-# ================= PARSER =================
-def parse_report_from_json(payload: dict) -> List[Dict]:
-    rows = []
-    raw = payload.get("rows")
-    if not isinstance(raw, list):
-        return rows
+# ================= Keitaro API client =================
+def keitaro_post(path: str, payload: Dict) -> Optional[Dict]:
+    """
+    Пробуем несколько вариантов авторизации:
+    - Bearer
+    - X-Api-Key
+    - api-key
+    """
+    url = f"{BASE_URL}{path}"
+    headers_variants = [
+        {"Authorization": f"Bearer {API_KEY}", "Accept": "application/json"},
+        {"X-Api-Key": API_KEY, "Accept": "application/json"},
+        {"api-key": API_KEY, "Accept": "application/json"},
+    ]
+    for headers in headers_variants:
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=40)
+            if r.status_code == 200:
+                return r.json()
+        except:
+            continue
+    return None
 
-    for r in raw:
-        dims = r.get("dimensions", {})
-        if isinstance(dims, dict):
-            rr = dict(dims)
-            rr.update(r)
-            r = rr
+def fetch_report() -> Dict:
+    """
+    В разных Keitaro пути отличаются, поэтому пробуем список.
+    """
+    report_cfg = json.loads(REPORT_CONFIG_JSON)
 
-        country = r.get("country") or r.get("geo") or ""
-        creative = r.get("creative_id") or ""
+    # типичные эндпоинты Keitaro 10.x (у разных сборок может отличаться)
+    endpoints = [
+        "/admin_api/v1/report/build",
+        "/admin_api/v1/report",
+        "/admin_api/v1/reports/build",
+        "/admin_api/v1/reports",
+    ]
+
+    for ep in endpoints:
+        data = keitaro_post(ep, report_cfg)
+        if isinstance(data, dict):
+            return data
+
+    raise RuntimeError("Keitaro API: не удалось получить отчёт. Проверь KEITARO_API_KEY / endpoint / права.")
+
+# ================= Parsing rows (универсально) =================
+def rows_from_response(resp: Dict) -> Tuple[List[Dict], List[str]]:
+    """
+    Возвращает: (rows_as_dicts, columns)
+    Поддержка форматов:
+      1) {"rows":[{...},{...}]}
+      2) {"rows":[{"dimensions":{...}, "metrics":{...}}]}
+      3) {"rows":[[...],[...]], "columns":[...]}
+      4) {"data":[...], "columns":[...]} и т.п.
+    """
+    if not isinstance(resp, dict):
+        return [], []
+
+    rows = resp.get("rows") or resp.get("data") or []
+    cols = resp.get("columns") or resp.get("cols") or []
+
+    if not isinstance(rows, list) or not rows:
+        return [], cols if isinstance(cols, list) else []
+
+    # case 1: list of dicts
+    if isinstance(rows[0], dict):
+        out = []
+        for r in rows:
+            d = dict(r)
+            # case 2: dimensions + metrics
+            dims = r.get("dimensions")
+            mets = r.get("metrics")
+            if isinstance(dims, dict):
+                d.update(dims)
+            if isinstance(mets, dict):
+                d.update(mets)
+            out.append(d)
+        return out, cols if isinstance(cols, list) else []
+
+    # case 3: list of lists + columns
+    if isinstance(rows[0], list) and isinstance(cols, list) and cols:
+        out = []
+        for arr in rows:
+            d = {}
+            for i, name in enumerate(cols):
+                if i < len(arr):
+                    d[str(name)] = arr[i]
+            out.append(d)
+        return out, cols
+
+    return [], cols if isinstance(cols, list) else []
+
+def normalize_rows(raw_rows: List[Dict]) -> List[Dict]:
+    """
+    Нормализуем строго под нужные поля:
+    country, creative_id, sub_id_2, conversions, sales, revenue
+    """
+    out = []
+    for r in raw_rows:
+        country = r.get("country") or r.get("geo") or r.get("country_flag") or ""
+        creative_id = r.get("creative_id") or ""
         sub2 = r.get("sub_id_2") or ""
 
-        leads = as_float(r.get("conversions"))
+        conversions = as_float(r.get("conversions") or r.get("conv") or r.get("leads"))
         sales = as_float(r.get("sales"))
         revenue = as_float(r.get("revenue"))
 
-        if not (country or creative or sub2):
+        if not (country or creative_id or sub2):
             continue
 
-        rows.append({
-            "k": f"{country}|{creative}|{sub2}",
-            "country": country,
-            "creative": creative,
-            "sub2": sub2,
-            "leads": leads,
+        out.append({
+            "k": f"{country}|{creative_id}|{sub2}",
+            "country": str(country),
+            "creative_id": str(creative_id),
+            "sub_id_2": str(sub2),
+            "conversions": conversions,
             "sales": sales,
             "revenue": revenue,
         })
+    return out
 
-    return rows
-
-# ================= FETCH =================
-def fetch_rows() -> List[Dict]:
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"]
-        )
-        ctx = browser.new_context(
-            viewport={"width": 1400, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        )
-        page = ctx.new_page()
-
-        # -------- LOGIN --------
-        page.goto("https://digitaltraff.click/admin/", wait_until="domcontentloaded")
-
-        page.fill("input[name='login'], input[type='text']", LOGIN_USER)
-        page.fill("input[name='password'], input[type='password']", LOGIN_PASS)
-
-        try:
-            page.get_by_role("button", name=re.compile("sign in|log in|увійти|войти", re.I)).click()
-        except:
-            page.keyboard.press("Enter")
-
-        try:
-            page.wait_for_selector("app-login", state="detached", timeout=15000)
-        except PWTimeout:
-            pass
-
-        captured = []
-        best_score = -1.0
-
-        def on_response(resp):
-            nonlocal captured, best_score
-            try:
-                data = resp.json()
-            except:
-                return
-
-            rows = parse_report_from_json(data)
-            if not rows:
-                return
-
-            score = sum(r["leads"] + r["sales"] + r["revenue"] for r in rows)
-            if score > best_score:
-                captured = rows
-                best_score = score
-
-        ctx.on("response", on_response)
-
-        page.goto(PAGE_URL, wait_until="domcontentloaded")
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except PWTimeout:
-            pass
-
-        time.sleep(1.5)
-        browser.close()
-
-        return captured
-
-# ================= MAIN =================
+# ================= Main =================
 def main():
     state = load_state()
+    prev_date = state.get("date", today())
     prev_rows = state.get("rows", {})
-    prev_date = state.get("date")
+    today_str = today()
 
-    rows = fetch_rows()
+    resp = fetch_report()
+    raw_rows, _ = rows_from_response(resp)
+    rows = normalize_rows(raw_rows)
+
     if not rows:
+        tg_send("accs on vacation...")
         return
 
-    if prev_date != today():
-        save_state({"date": today(), "rows": {r["k"]: r for r in rows}})
+    # reset baseline на новый день
+    if prev_date != today_str:
+        save_state({"date": today_str, "rows": {r["k"]: r for r in rows}})
+        tg_send("accs on vacation...")
         return
 
-    new_rows = {}
     lead_msgs = []
     sale_msgs = []
+    new_map = {}
 
     for r in rows:
         k = r["k"]
-        old = prev_rows.get(k, {"leads": 0, "sales": 0, "revenue": 0})
+        old = prev_rows.get(k, {"conversions": 0, "sales": 0, "revenue": 0})
 
-        if r["leads"] - old["leads"] > EPS:
+        # LEAD
+        if r["conversions"] - as_float(old.get("conversions")) > EPS:
             lead_msgs.append(
                 "🟩 *LEAD ALERT*\n"
                 f"Country: {r['country']}\n"
-                f"Creative ID: {r['creative']}\n"
-                f"Sub ID 2: {r['sub2']}\n"
-                f"Leads: {int(old['leads'])} → {int(r['leads'])}"
+                f"Creative ID: {r['creative_id']}\n"
+                f"Sub ID 2: {r['sub_id_2']}\n"
+                f"Leads: {int(as_float(old.get('conversions')))} → {int(r['conversions'])}"
             )
 
-        if r["sales"] - old["sales"] > EPS:
-            delta_rev = r["revenue"] - old["revenue"]
+        # SALE + revenue delta (сумма продажи)
+        if r["sales"] - as_float(old.get("sales")) > EPS:
+            delta_rev = r["revenue"] - as_float(old.get("revenue"))
             sale_msgs.append(
                 "🟦 *SALE ALERT*\n"
                 f"Country: {r['country']}\n"
-                f"Creative ID: {r['creative']}\n"
-                f"Sub ID 2: {r['sub2']}\n"
-                f"Sales: {int(old['sales'])} → {int(r['sales'])}\n"
+                f"Creative ID: {r['creative_id']}\n"
+                f"Sub ID 2: {r['sub_id_2']}\n"
+                f"Sales: {int(as_float(old.get('sales')))} → {int(r['sales'])}\n"
                 f"Revenue: {money(delta_rev)}"
             )
 
-        new_rows[k] = r
+        new_map[k] = r
 
     if lead_msgs or sale_msgs:
         tg_send("\n\n".join(lead_msgs + sale_msgs))
 
-    save_state({"date": today(), "rows": new_rows})
+    save_state({"date": today_str, "rows": new_map})
 
 if __name__ == "__main__":
     main()
