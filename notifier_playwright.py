@@ -1,4 +1,4 @@
-# notifier_playwright.py — стабильные алерты без дублей (Keitaro TEAM)
+# notifier_playwright.py — стабильные алерты без дублей (Keitaro Campaigns Report)
 
 import os, json, time, re
 from typing import Dict, List, Tuple
@@ -28,37 +28,30 @@ KYIV_TZ   = ZoneInfo(os.getenv("KYIV_TZ", "Europe/Kyiv"))
 
 EPS = 0.009
 
-# ========= TIME =========
-def now_kyiv() -> datetime:
+# ========= utils =========
+def now_kyiv():
     return datetime.now(KYIV_TZ)
 
-def kyiv_today_str() -> str:
+def kyiv_today_str():
     return now_kyiv().strftime("%Y-%m-%d")
 
-# ========= FORMAT =========
-def fmt_money(x: float) -> str:
+def fmt_money(x: float):
     return f"${x:,.2f}"
 
-def pct(delta: float, base: float) -> float:
-    if abs(base) < EPS:
-        return 100.0
-    return abs(delta / base) * 100.0
-
-def direction_ok(delta: float) -> bool:
+def direction_ok(delta: float):
     if SPEND_DIR == "up":
         return delta > EPS
     if SPEND_DIR == "down":
         return delta < -EPS
     return abs(delta) > EPS
 
-# ========= STATE (GIST) =========
-def load_state() -> Dict:
+# ========= GIST =========
+def load_state():
     url = f"https://api.github.com/gists/{GIST_ID}"
     r = requests.get(url, headers={
         "Authorization": f"Bearer {GIST_TOKEN}",
         "Accept": "application/vnd.github+json"
-    }, timeout=30)
-
+    })
     if r.status_code == 200:
         files = r.json().get("files", {})
         if GIST_FILENAME in files:
@@ -66,124 +59,108 @@ def load_state() -> Dict:
                 return json.loads(files[GIST_FILENAME]["content"])
             except:
                 pass
-
     return {"date": kyiv_today_str(), "rows": {}}
 
-def save_state(state: Dict):
+def save_state(state):
     url = f"https://api.github.com/gists/{GIST_ID}"
-    requests.patch(
-        url,
-        headers={
-            "Authorization": f"Bearer {GIST_TOKEN}",
-            "Accept": "application/vnd.github+json"
-        },
-        json={"files": {
-            GIST_FILENAME: {
-                "content": json.dumps(state, ensure_ascii=False, indent=2)
-            }
-        }},
-        timeout=30
-    ).raise_for_status()
+    files = {GIST_FILENAME: {"content": json.dumps(state, indent=2)}}
+    requests.patch(url, headers={
+        "Authorization": f"Bearer {GIST_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }, json={"files": files})
 
-# ========= TELEGRAM =========
+# ========= Telegram =========
 def tg_send(text: str):
     for cid in CHAT_IDS:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                json={
-                    "chat_id": cid,
-                    "text": text,
-                    "parse_mode": "Markdown",
-                    "disable_web_page_preview": True
-                },
-                timeout=20
-            )
-        except:
-            pass
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": cid, "text": text, "parse_mode": "Markdown"},
+            timeout=10
+        )
 
-# ========= HELPERS =========
+# ========= parsing =========
 def as_float(v):
     try:
         return float(v or 0)
     except:
         return 0.0
 
-# ========= PARSE XHR =========
-def parse_report_from_json(payload: dict) -> List[Dict]:
+def parse_report_from_json(payload: dict):
     rows = []
     for r in payload.get("rows", []):
-        dims = r.get("dimensions", {}) or {}
-        g = lambda k: r.get(k) or dims.get(k) or ""
+        dims = r.get("dimensions", {})
+        country = dims.get("country", "")
+        creative = dims.get("creative_id", "")
+        sub2 = dims.get("sub_id_2", "")
 
         rows.append({
-            "k": f"{g('campaign_id')}|{g('creative_id')}|{g('sub_id_2')}|{g('country')}",
-            "campaign": str(g("campaign_id")),
-            "creative": str(g("creative_id")),
-            "sub2": str(g("sub_id_2")),
-            "geo": str(g("country")),
-            "cost": as_float(r.get("cost")),
+            "k": f"{country}|{creative}|{sub2}",
+            "country": country,
+            "creative": creative,
+            "sub2": sub2,
             "leads": as_float(r.get("conversions")),
             "sales": as_float(r.get("sales")),
+            "revenue": as_float(r.get("revenue")),
+            "cost": as_float(r.get("cost")),
         })
     return rows
 
-# ========= FETCH =========
-def fetch_rows() -> List[Dict]:
+# ========= fetch =========
+def fetch_rows():
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"]
-        )
-        ctx = browser.new_context(
-            viewport={"width": 1400, "height": 900},
-            user_agent="Mozilla/5.0 Chrome/124"
-        )
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context()
         page = ctx.new_page()
 
-        # ===== LOGIN (FIXED) =====
+        # ---- LOGIN ----
         page.goto("https://digitaltraff.click/admin/", wait_until="domcontentloaded")
 
-        page.wait_for_selector("app-login", timeout=15000)
+        page.wait_for_selector("app-login", timeout=20000)
 
-        page.get_by_placeholder("Username").fill(LOGIN_USER)
-        page.get_by_placeholder("Password").fill(LOGIN_PASS)
-        page.get_by_role("button", name="Sign in").click()
+        page.fill("input[placeholder='Username'], input[name='login']", LOGIN_USER)
+        page.fill("input[placeholder='Password'], input[name='password']", LOGIN_PASS)
+        page.click("button:has-text('Sign in')")
 
-        page.wait_for_selector("app-login", state="detached", timeout=20000)
+        page.wait_for_selector("keitaro-app", timeout=20000)
 
+        # ---- XHR CAPTURE ----
         captured = []
-        best_score = -1.0
 
         def on_response(resp):
-            nonlocal captured, best_score
-            if "/admin/api/reports/" in resp.url:
+            if "/admin/api/reports/campaigns" in resp.url:
                 try:
                     data = resp.json()
+                    rows = parse_report_from_json(data)
+                    if rows:
+                        captured.extend(rows)
                 except:
-                    return
-                rows = parse_report_from_json(data)
-                if not rows:
-                    return
-                score = sum(r["cost"] for r in rows)
-                if score > best_score:
-                    best_score = score
-                    captured = rows
+                    pass
 
         ctx.on("response", on_response)
 
+        # ---- OPEN REPORT ----
         page.goto(PAGE_URL, wait_until="domcontentloaded")
-        page.wait_for_load_state("networkidle", timeout=20000)
-        time.sleep(1.5)
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except:
+            pass
+
+        # 🔴 CRITICAL: force refresh to trigger XHR
+        try:
+            page.click("button[aria-label='Refresh'], button:has-text('Refresh')", timeout=5000)
+        except:
+            pass
+
+        time.sleep(3)
 
         browser.close()
         return captured
 
-# ========= MAIN =========
+# ========= main =========
 def main():
     state = load_state()
-    prev_date = state["date"]
-    prev_rows = state["rows"]
+    prev = state.get("rows", {})
     today = kyiv_today_str()
 
     rows = fetch_rows()
@@ -191,55 +168,39 @@ def main():
         tg_send("⚠️ No data fetched")
         return
 
-    if prev_date != today:
-        save_state({"date": today, "rows": {r["k"]: r for r in rows}})
-        tg_send("🔄 New day baseline saved")
-        return
-
-    new_map = {}
-    msgs = []
+    new_rows = {}
+    lead_msgs = []
+    sale_msgs = []
 
     for r in rows:
         k = r["k"]
-        old = prev_rows.get(k)
+        old = prev.get(k, {"leads": 0, "sales": 0, "revenue": 0})
 
-        if old:
-            # SPEND
-            delta = r["cost"] - old["cost"]
-            if direction_ok(delta):
-                msgs.append(
-                    "🧊 *SPEND ALERT*\n"
-                    f"Campaign: {r['campaign']}\n"
-                    f"Creative: {r['creative']}  Sub2: {r['sub2']}  Geo: {r['geo']}\n"
-                    f"Cost: {fmt_money(old['cost'])} → {fmt_money(r['cost'])} "
-                    f"(Δ {fmt_money(delta)}, {pct(delta, old['cost']):.0f}%)"
-                )
+        # LEADS
+        if r["leads"] > old["leads"]:
+            lead_msgs.append(
+                f"🟩 *LEAD*\n"
+                f"{r['country']} | {r['creative']} | {r['sub2']}\n"
+                f"{int(old['leads'])} → {int(r['leads'])}"
+            )
 
-            # LEADS
-            if r["leads"] > old["leads"]:
-                msgs.append(
-                    "🟩 *LEAD ALERT*\n"
-                    f"Campaign: {r['campaign']}\n"
-                    f"Creative: {r['creative']}  Sub2: {r['sub2']}  Geo: {r['geo']}\n"
-                    f"Leads: {int(old['leads'])} → {int(r['leads'])}"
-                )
+        # SALES
+        if r["sales"] > old["sales"]:
+            delta_rev = r["revenue"] - old.get("revenue", 0)
+            sale_msgs.append(
+                f"🟦 *SALE*\n"
+                f"{r['country']} | {r['creative']} | {r['sub2']}\n"
+                f"Sales: {int(old['sales'])} → {int(r['sales'])}\n"
+                f"Revenue +{fmt_money(delta_rev)}"
+            )
 
-            # SALES
-            if r["sales"] > old["sales"]:
-                msgs.append(
-                    "🟦 *SALE ALERT*\n"
-                    f"Campaign: {r['campaign']}\n"
-                    f"Creative: {r['creative']}  Sub2: {r['sub2']}  Geo: {r['geo']}\n"
-                    f"Sales: {int(old['sales'])} → {int(r['sales'])}"
-                )
+        new_rows[k] = r
 
-        new_map[k] = r
-
+    msgs = lead_msgs + sale_msgs
     if msgs:
         tg_send("\n\n".join(msgs))
 
-    save_state({"date": today, "rows": new_map})
+    save_state({"date": today, "rows": new_rows})
 
-# ========= RUN =========
 if __name__ == "__main__":
     main()
