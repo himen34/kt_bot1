@@ -6,10 +6,7 @@ from zoneinfo import ZoneInfo
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# ================= CONFIG =================
-BASE_URL = "https://digitaltraff.click"   # твой Keitaro
-DEBUG = False
-
+# ================= ENV =================
 LOGIN_USER = os.environ["LOGIN_USER"]
 LOGIN_PASS = os.environ["LOGIN_PASS"]
 PAGE_URL   = os.environ["PAGE_URL"]
@@ -19,23 +16,15 @@ TG_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 GIST_ID    = os.environ["GIST_ID"]
 GIST_TOKEN = os.environ["GIST_TOKEN"]
-GIST_FILE  = "keitaro_today_cpa.json"
+GIST_FILENAME = os.getenv("GIST_FILENAME", "keitaro_favourite_state.json")
 
 TZ = ZoneInfo("Europe/Kyiv")
-EPS = 0.001
+EPS = 0.0001
 
 
 # ================= TIME =================
-def today_key() -> str:
+def today_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d")
-
-
-# ================= HELPERS =================
-def as_float(v):
-    try:
-        return float(v or 0)
-    except:
-        return 0.0
 
 
 # ================= TELEGRAM =================
@@ -47,29 +36,30 @@ def tg_send(text: str):
                 "chat_id": TG_CHAT_ID,
                 "text": text,
                 "parse_mode": "Markdown",
-                "disable_web_page_preview": True,
+                "disable_web_page_preview": True
             },
-            timeout=20,
+            timeout=20
         )
-    except:
+    except Exception:
         pass
 
 
-# ================= GIST =================
+# ================= STATE (GIST) =================
 def load_state() -> Dict:
-    r = requests.get(
-        f"https://api.github.com/gists/{GIST_ID}",
-        headers={"Authorization": f"Bearer {GIST_TOKEN}"},
-        timeout=20,
-    )
-    if r.status_code == 200:
-        files = r.json().get("files", {})
-        if GIST_FILE in files:
-            try:
-                return json.loads(files[GIST_FILE]["content"])
-            except:
-                pass
-    return {"date": today_key(), "rows": {}}
+    try:
+        r = requests.get(
+            f"https://api.github.com/gists/{GIST_ID}",
+            headers={"Authorization": f"Bearer {GIST_TOKEN}"},
+            timeout=20
+        )
+        if r.status_code == 200:
+            files = r.json().get("files", {})
+            if GIST_FILENAME in files:
+                return json.loads(files[GIST_FILENAME]["content"])
+    except Exception:
+        pass
+
+    return {"date": today_str(), "rows": {}}
 
 
 def save_state(state: Dict):
@@ -78,52 +68,40 @@ def save_state(state: Dict):
         headers={"Authorization": f"Bearer {GIST_TOKEN}"},
         json={
             "files": {
-                GIST_FILE: {
+                GIST_FILENAME: {
                     "content": json.dumps(state, ensure_ascii=False, indent=2)
                 }
             }
         },
-        timeout=20,
-    ).raise_for_status()
+        timeout=20
+    )
 
 
-# ================= PARSE JSON =================
-def parse_today_cpa(payload: dict) -> List[Dict]:
+# ================= HELPERS =================
+def as_float(v) -> float:
+    try:
+        return float(v)
+    except:
+        return 0.0
+
+
+# ================= PARSE FAVOURITE JSON =================
+def parse_favourite_json(payload: dict) -> List[Dict]:
     rows = []
     for r in payload.get("rows", []):
-        dims = r.get("dimensions", {}) or {}
-
-        def g(k):
-            return r.get(k) or dims.get(k) or ""
+        d = r.get("dimensions", {}) or {}
 
         row = {
-            "k": f"{g('campaign')}|{g('country')}|{g('external_id')}|{g('creative_id')}",
-            "campaign": str(g("campaign")),
-            "country": str(g("country")),
-            "external_id": str(g("external_id")),
-            "creative_id": str(g("creative_id")),
+            "k": f"{d.get('campaign')}|{d.get('country')}|{d.get('creative_id')}",
+            "campaign": d.get("campaign"),
+            "country": d.get("country"),
+            "creative_id": d.get("creative_id"),
             "conversions": as_float(r.get("conversions")),
             "sales": as_float(r.get("sales")),
-            "revenue": as_float(r.get("deposit_revenue") or r.get("sale_revenue")),
-            "cpa": as_float(r.get("cpa")),
+            "revenue": as_float(r.get("sale_revenue")),
         }
         rows.append(row)
     return rows
-
-
-def aggregate_max(rows: List[Dict]) -> List[Dict]:
-    acc = {}
-    for r in rows:
-        k = r["k"]
-        if k not in acc:
-            acc[k] = dict(r)
-        else:
-            a = acc[k]
-            a["conversions"] = max(a["conversions"], r["conversions"])
-            a["sales"] = max(a["sales"], r["sales"])
-            a["revenue"] = max(a["revenue"], r["revenue"])
-            a["cpa"] = max(a["cpa"], r["cpa"])
-    return list(acc.values())
 
 
 # ================= FETCH =================
@@ -134,67 +112,60 @@ def fetch_rows() -> List[Dict]:
         page = ctx.new_page()
 
         # LOGIN
-        page.goto(f"{BASE_URL}/admin/", wait_until="domcontentloaded")
-        page.fill("input[name='login'], input[type='text']", LOGIN_USER)
-        page.fill("input[name='password'], input[type='password']", LOGIN_PASS)
-        page.click("button[type='submit']")
+        page.goto("https://digitaltraff.click/admin/", wait_until="domcontentloaded")
+        page.get_by_placeholder("Username").fill(LOGIN_USER)
+        page.get_by_placeholder("Password").fill(LOGIN_PASS)
+        page.get_by_role("button", name=re.compile("sign in", re.I)).click()
 
         try:
             page.wait_for_selector("app-login", state="detached", timeout=15000)
         except PWTimeout:
             pass
 
-        captured = []
-        best_len = 0
+        captured: List[Dict] = []
 
         def on_response(resp):
-            nonlocal captured, best_len
+            nonlocal captured
             url = resp.url.lower()
-
-            if DEBUG:
-                print("XHR:", url)
-
-            # 🔥 КЛЮЧЕВОЙ ФИЛЬТР
             if "/admin/api/reports/favourite" not in url:
                 return
-
             try:
                 data = resp.json()
-            except:
+            except Exception:
                 return
-
-            rows = parse_today_cpa(data)
-            if rows and len(rows) > best_len:
+            rows = parse_favourite_json(data)
+            if rows:
                 captured = rows
-                best_len = len(rows)
 
         ctx.on("response", on_response)
 
-        # ОТКРЫВАЕМ ОТЧЁТ
         page.goto(PAGE_URL, wait_until="domcontentloaded")
-        time.sleep(3)
+        time.sleep(2.5)
 
         browser.close()
-        return aggregate_max(captured)
+        return captured
 
 
 # ================= MAIN =================
 def main():
     state = load_state()
-    today = today_key()
+    today = today_str()
 
     rows = fetch_rows()
     if not rows:
         tg_send("⚠️ Keitaro: no data")
         return
 
+    # reset every day
     if state["date"] != today:
-        save_state({"date": today, "rows": {r["k"]: r for r in rows}})
+        save_state({
+            "date": today,
+            "rows": {r["k"]: r for r in rows}
+        })
         return
 
     prev = state["rows"]
-    new_map = {}
-
+    new_state = {}
     alerts = []
 
     for r in rows:
@@ -202,39 +173,38 @@ def main():
         old = prev.get(k)
 
         header = (
-            f"{r['campaign']} | {r['country']} | "
-            f"{r['external_id']} | {r['creative_id']}"
+            f"Campaign: {r['campaign']}\n"
+            f"Country: {r['country']}\n"
+            f"Creative: {r['creative_id']}"
         )
 
         if old:
-            if r["conversions"] - old.get("conversions", 0) > EPS:
+            # CONVERSIONS
+            if r["conversions"] > old.get("conversions", 0) + EPS:
                 alerts.append(
-                    "🟩 *LEAD ALERT*\n"
+                    "🟩 *CONVERSION ALERT*\n"
                     f"{header}\n"
-                    f"Conv: {int(old['conversions'])} → {int(r['conversions'])} • CPA: ${r['cpa']:.2f}"
+                    f"Conversions: {int(old['conversions'])} → {int(r['conversions'])}"
                 )
 
-            if r["sales"] - old.get("sales", 0) > EPS:
+            # SALES
+            if r["sales"] > old.get("sales", 0) + EPS:
                 alerts.append(
                     "🟦 *SALE ALERT*\n"
                     f"{header}\n"
                     f"Sales: {int(old['sales'])} → {int(r['sales'])}\n"
                     f"Revenue: ${r['revenue']:.2f}"
                 )
-        else:
-            if r["conversions"] > 0:
-                alerts.append(
-                    "🟩 *LEAD ALERT*\n"
-                    f"{header}\n"
-                    f"Conv: 0 → {int(r['conversions'])} • CPA: ${r['cpa']:.2f}"
-                )
 
-        new_map[k] = r
+        new_state[k] = r
 
     if alerts:
         tg_send("\n\n".join(alerts))
 
-    save_state({"date": today, "rows": new_map})
+    save_state({
+        "date": today,
+        "rows": new_state
+    })
 
 
 if __name__ == "__main__":
