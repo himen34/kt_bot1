@@ -1,12 +1,14 @@
 import os, json, time, re
-from typing import Dict, List, Tuple
+from typing import Dict, List
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# ================= ENV =================
+# ================= CONFIG =================
+DEBUG = False   # поставь True на 1 запуск для логов XHR
+
 LOGIN_USER = os.environ["LOGIN_USER"]
 LOGIN_PASS = os.environ["LOGIN_PASS"]
 PAGE_URL   = os.environ["PAGE_URL"]
@@ -23,7 +25,7 @@ GIST_FILENAME = os.getenv("GIST_FILENAME", "keitaro_state.json")
 KYIV_TZ = ZoneInfo(os.getenv("KYIV_TZ", "Europe/Kyiv"))
 EPS = 0.0001
 
-# ================= utils =================
+# ================= UTILS =================
 def now_kyiv() -> datetime:
     return datetime.now(KYIV_TZ)
 
@@ -36,11 +38,10 @@ def as_float(v):
     except:
         return 0.0
 
-# ================= Gist =================
+# ================= GIST =================
 def load_state() -> Dict:
-    url = f"https://api.github.com/gists/{GIST_ID}"
     r = requests.get(
-        url,
+        f"https://api.github.com/gists/{GIST_ID}",
         headers={
             "Authorization": f"Bearer {GIST_TOKEN}",
             "Accept": "application/vnd.github+json"
@@ -57,9 +58,8 @@ def load_state() -> Dict:
     return {"date": kyiv_today_str(), "rows": {}}
 
 def save_state(state: Dict):
-    url = f"https://api.github.com/gists/{GIST_ID}"
-    r = requests.patch(
-        url,
+    requests.patch(
+        f"https://api.github.com/gists/{GIST_ID}",
         headers={
             "Authorization": f"Bearer {GIST_TOKEN}",
             "Accept": "application/vnd.github+json"
@@ -72,10 +72,9 @@ def save_state(state: Dict):
             }
         },
         timeout=30
-    )
-    r.raise_for_status()
+    ).raise_for_status()
 
-# ================= Telegram =================
+# ================= TELEGRAM =================
 def tg_send(text: str):
     for cid in CHAT_IDS:
         try:
@@ -92,7 +91,7 @@ def tg_send(text: str):
         except:
             pass
 
-# ================= Parsing =================
+# ================= PARSE KEITARO JSON =================
 def parse_report_from_json(payload: dict) -> List[Dict]:
     rows = []
     for r in payload.get("rows", []):
@@ -127,7 +126,7 @@ def aggregate_rows_max(rows: List[Dict]) -> List[Dict]:
             a["cpa"]   = max(a["cpa"],   r["cpa"])
     return list(acc.values())
 
-# ================= Fetch =================
+# ================= FETCH ROWS (CORE) =================
 def fetch_rows() -> List[Dict]:
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -144,17 +143,11 @@ def fetch_rows() -> List[Dict]:
         )
         page = ctx.new_page()
 
-        # LOGIN
-        page.goto("https://trident.partners/admin/", wait_until="domcontentloaded")
-        try:
-            page.fill("input[name='login'], input[type='text']", LOGIN_USER)
-            page.fill("input[name='password'], input[type='password']", LOGIN_PASS)
-            page.get_by_role(
-                "button",
-                name=re.compile("sign in|войти|увійти", re.I)
-            ).click()
-        except Exception:
-            pass
+        # ===== LOGIN =====
+        page.goto("https://digitaltraff.click/admin/", wait_until="domcontentloaded")
+        page.get_by_placeholder("Username").fill(LOGIN_USER)
+        page.get_by_placeholder("Password").fill(LOGIN_PASS)
+        page.get_by_role("button", name=re.compile("sign in", re.I)).click()
 
         try:
             page.wait_for_selector("app-login", state="detached", timeout=15000)
@@ -167,31 +160,40 @@ def fetch_rows() -> List[Dict]:
         def on_response(resp):
             nonlocal captured, best_len
             url = (resp.url or "").lower()
-            if "/report" not in url:
+
+            if DEBUG:
+                print("XHR:", url)
+
+            # 🔥 РЕАЛЬНЫЙ ENDPOINT KEITARO
+            if "/admin/api/reports" not in url:
                 return
+
             try:
                 data = resp.json()
             except:
                 return
+
             rows = parse_report_from_json(data)
+
+            if DEBUG:
+                print("  rows:", len(rows))
+
             if rows and len(rows) > best_len:
                 captured = rows
                 best_len = len(rows)
 
         ctx.on("response", on_response)
 
+        # ===== OPEN REPORT =====
         page.goto(PAGE_URL, wait_until="domcontentloaded")
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except PWTimeout:
-            pass
 
-        time.sleep(1.5)
+        # SPA — просто даём время
+        time.sleep(3.0)
+
         browser.close()
-
         return aggregate_rows_max(captured)
 
-# ================= Main =================
+# ================= MAIN =================
 def main():
     state = load_state()
     prev_date = state.get("date", kyiv_today_str())
@@ -208,8 +210,7 @@ def main():
         return
 
     new_map: Dict[str, Dict] = {}
-    lead_msgs: List[str] = []
-    sale_msgs: List[str] = []
+    lead_msgs, sale_msgs = [], []
 
     for r in rows:
         k = r["k"]
