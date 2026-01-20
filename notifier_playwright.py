@@ -1,144 +1,192 @@
+# notifier_playwright.py — Keitaro campaigns report (FULL LOGIC)
+
 import os, json, time
 from typing import Dict, List
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
 import requests
+from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PWTimeout
 
-from playwright.sync_api import sync_playwright, TimeoutError
-
-# ====== ENV ======
-PAGE_URL = os.environ["PAGE_URL"]
+# ========= ENV =========
+LOGIN_USER = os.environ["LOGIN_USER"]
+LOGIN_PASS = os.environ["LOGIN_PASS"]
+PAGE_URL   = os.environ["PAGE_URL"]
 
 TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_IDS = [os.environ.get("TELEGRAM_CHAT_ID_1"), os.environ.get("TELEGRAM_CHAT_ID_2")]
-CHAT_IDS = [c for c in CHAT_IDS if c]
+TG_CHAT_ID_1 = os.getenv("TELEGRAM_CHAT_ID_1")
+TG_CHAT_ID_2 = os.getenv("TELEGRAM_CHAT_ID_2")
+CHAT_IDS = [c for c in (TG_CHAT_ID_1, TG_CHAT_ID_2) if c]
 
-GIST_ID = os.environ["GIST_ID"]
+GIST_ID    = os.environ["GIST_ID"]
 GIST_TOKEN = os.environ["GIST_TOKEN"]
-GIST_FILENAME = os.getenv("GIST_FILENAME", "keitaro_state.json")
+GIST_FILENAME = "keitaro_campaign_state.json"
 
-TZ = ZoneInfo("Europe/Warsaw")
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
 EPS = 0.0001
 
-# ====== helpers ======
-def now_day():
-    return datetime.now(TZ).strftime("%Y-%m-%d")
+# ========= UTILS =========
+def now():
+    return datetime.now(KYIV_TZ)
+
+def today():
+    return now().strftime("%Y-%m-%d")
+
+def f(v):
+    try:
+        return float(v)
+    except:
+        return 0.0
 
 def money(x):
     return f"${x:,.2f}"
 
-def tg_send(msg):
-    for cid in CHAT_IDS:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": cid, "text": msg, "parse_mode": "Markdown"},
-            timeout=20
-        )
-
-# ====== GIST ======
+# ========= GIST =========
 def load_state():
     r = requests.get(
         f"https://api.github.com/gists/{GIST_ID}",
         headers={"Authorization": f"Bearer {GIST_TOKEN}"},
-        timeout=20
+        timeout=30
     )
     if r.status_code == 200:
-        try:
-            return json.loads(r.json()["files"][GIST_FILENAME]["content"])
-        except:
-            pass
-    return {"date": now_day(), "rows": {}}
+        files = r.json().get("files", {})
+        if GIST_FILENAME in files:
+            return json.loads(files[GIST_FILENAME]["content"])
+    return {"date": today(), "rows": {}}
 
 def save_state(state):
     requests.patch(
         f"https://api.github.com/gists/{GIST_ID}",
         headers={"Authorization": f"Bearer {GIST_TOKEN}"},
         json={"files": {GIST_FILENAME: {"content": json.dumps(state, indent=2)}}},
-        timeout=20
+        timeout=30
     )
 
-# ====== PARSE TABLE ======
+# ========= TELEGRAM =========
+def tg_send(text):
+    for cid in CHAT_IDS:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": cid, "text": text, "parse_mode": "Markdown"},
+            timeout=20
+        )
+
+# ========= PARSER =========
+def parse_keitaro(payload: dict) -> List[Dict]:
+    rows = []
+    for r in payload.get("rows", []):
+        d = r.get("dimensions", {})
+        rows.append({
+            "k": f"{d.get('country')}|{d.get('creative_id')}|{d.get('sub_id_2')}",
+            "country": d.get("country"),
+            "creative": d.get("creative_id"),
+            "sub2": d.get("sub_id_2"),
+
+            "cost": f(r.get("cost")),
+            "leads": f(r.get("conversions")),   # 👈 IMPORTANT
+            "sales": f(r.get("sales")),
+        })
+    return rows
+
+# ========= FETCH =========
 def fetch_rows():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context(storage_state="storage_state.json")
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context()
         page = ctx.new_page()
 
-        page.goto(PAGE_URL, wait_until="networkidle")
+        page.goto("https://digitaltraff.click/admin/", wait_until="domcontentloaded")
+        page.fill("input[name='email']", LOGIN_USER)
+        page.fill("input[name='password']", LOGIN_PASS)
+        page.click("button[type='submit']")
 
         try:
-            page.wait_for_selector("table", timeout=15000)
-        except TimeoutError:
-            return []
+            page.wait_for_selector("text=Дашборд", timeout=15000)
+        except PWTimeout:
+            pass
 
-        rows = []
-        for tr in page.query_selector_all("tbody tr"):
-            tds = tr.query_selector_all("td")
-            if len(tds) < 7:
-                continue
+        captured = []
 
-            def t(i):
-                return tds[i].inner_text().strip()
+        def on_resp(resp):
+            nonlocal captured
+            if "/admin/api/reports/campaigns" in resp.url:
+                try:
+                    data = resp.json()
+                    rows = parse_keitaro(data)
+                    if rows:
+                        captured = rows
+                except:
+                    pass
 
-            rows.append({
-                "country": t(0),
-                "creative": t(1),
-                "sub2": t(2),
-                "conversions": float(t(5) or 0),
-                "sales": float(t(6) or 0),
-                "revenue": float(t(7).replace("$", "").replace(",", "") or 0),
-            })
+        ctx.on("response", on_resp)
+        page.goto(PAGE_URL, wait_until="domcontentloaded")
+        time.sleep(5)
 
         browser.close()
-        return rows
+        return captured
 
-# ====== MAIN ======
+# ========= MAIN =========
 def main():
     state = load_state()
+    prev_date = state["date"]
     prev_rows = state["rows"]
-    today = now_day()
 
     rows = fetch_rows()
     if not rows:
-        tg_send("accs on vacation...")
+        tg_send("⚠️ Keitaro: no data")
         return
 
-    if state["date"] != today:
-        save_state({"date": today, "rows": {}})
-        tg_send("accs on vacation...")
+    if prev_date != today():
+        save_state({"date": today(), "rows": {r["k"]: r for r in rows}})
+        tg_send("🔄 New day — baseline reset")
         return
 
-    new_rows = {}
-    alerts = []
+    spend_msgs = []
+    lead_msgs = []
+    sale_msgs = []
+
+    new_map = {}
 
     for r in rows:
-        k = f"{r['country']}|{r['creative']}|{r['sub2']}"
-        old = prev_rows.get(k, {"conversions": 0, "sales": 0, "revenue": 0})
+        k = r["k"]
+        old = prev_rows.get(k)
 
-        if r["conversions"] > old["conversions"]:
-            alerts.append(
-                f"🟩 *LEAD*\n"
-                f"Country: {r['country']}\n"
-                f"Creative: {r['creative']}\n"
-                f"SubID2: {r['sub2']}"
-            )
+        if old:
+            # ---- SPEND ----
+            dc = r["cost"] - old["cost"]
+            if abs(dc) > EPS:
+                spend_msgs.append(
+                    f"🧊 *SPEND ALERT*\n"
+                    f"{r['country']} | {r['creative']} | {r['sub2']}\n"
+                    f"{money(old['cost'])} → {money(r['cost'])}"
+                )
 
-        if r["sales"] > old["sales"]:
-            delta = r["revenue"] - old["revenue"]
-            alerts.append(
-                f"🟦 *SALE*\n"
-                f"Country: {r['country']}\n"
-                f"Creative: {r['creative']}\n"
-                f"SubID2: {r['sub2']}\n"
-                f"Revenue: {money(delta)}"
-            )
+            # ---- LEADS ----
+            dl = r["leads"] - old["leads"]
+            if dl > EPS:
+                lead_msgs.append(
+                    f"🟩 *LEAD ALERT*\n"
+                    f"{r['country']} | {r['creative']} | {r['sub2']}\n"
+                    f"{int(old['leads'])} → {int(r['leads'])}"
+                )
 
-        new_rows[k] = r
+            # ---- SALES ----
+            ds = r["sales"] - old["sales"]
+            if ds > EPS:
+                sale_msgs.append(
+                    f"🟦 *SALE ALERT*\n"
+                    f"{r['country']} | {r['creative']} | {r['sub2']}\n"
+                    f"{int(old['sales'])} → {int(r['sales'])}"
+                )
 
-    if alerts:
-        tg_send("\n\n".join(alerts))
+        new_map[k] = r
 
-    save_state({"date": today, "rows": new_rows})
+    msgs = spend_msgs + lead_msgs + sale_msgs
+    if msgs:
+        tg_send("\n\n".join(msgs))
+
+    save_state({"date": today(), "rows": new_map})
 
 if __name__ == "__main__":
     main()
